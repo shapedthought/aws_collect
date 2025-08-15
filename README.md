@@ -1,5 +1,13 @@
 # AWS Collect
 
+🤖 AI Disclosure
+Portions of the code and/or documentation for this project were created with the assistance of an AI system.      
+
+All AI-generated content has been reviewed, tested, and validated by a human before inclusion in this repository.
+
+However, as the code is provided under MIT please excercise due dilience when running the code.
+
+
 ## Overview
 
 The **AWS Collect** script programmatically collects and organizes your AWS resources in a top-down, hierarchical structure, as depicted in the supplied architecture diagram:
