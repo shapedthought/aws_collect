@@ -1,36 +1,45 @@
 import boto3
+from botocore.exceptions import ClientError
 from collections import defaultdict
 import json
+import logging
 from datetime import datetime
+
+# --- Setup Logging ---
+# Configure logging to provide informative output.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class AWSResourceHierarchy:
     def __init__(self):
-        # If you want nested defaultdicts:
+        """
+        Initializes the data structure for holding the resource hierarchy.
+        Using nested defaultdicts simplifies adding new regions and VPCs.
+        """
         self.hierarchy = defaultdict(lambda: defaultdict(dict))
 
-        # Or, if you want to avoid type issues, use a plain dict:
-        # self.hierarchy = {}
-        
     def build_hierarchy(self, regions=None):
-        """Build complete AWS resource hierarchy by region"""
+        """
+        Builds a complete AWS resource hierarchy.
+        If regions are not specified, it attempts to discover all available regions.
+        """
         if not regions:
             try:
-                ec2 = boto3.client('ec2')
-                regions = [r['RegionName'] for r in ec2.describe_regions()['Regions']]
-            except Exception as e:
-                print(f"Error getting regions: {e}")
+                ec2_client = boto3.client('ec2')
+                regions = [r['RegionName'] for r in ec2_client.describe_regions()['Regions']]
+            except ClientError as e:
+                logging.error(f"Error getting AWS regions. Check credentials and permissions. Details: {e}")
                 return {}
         
         for region in regions:
-            print(f"Processing region: {region}")
+            logging.info(f"Processing region: {region}")
             self._build_region_hierarchy(region)
             
         return dict(self.hierarchy)
     
     def _build_region_hierarchy(self, region):
-        """Build hierarchy for a specific region"""
+        """Builds the hierarchy for a single specified region."""
         try:
-            # Initialize clients for the region
+            # Initialize clients for the specified region
             ec2 = boto3.client('ec2', region_name=region)
             rds = boto3.client('rds', region_name=region)
             efs = boto3.client('efs', region_name=region)
@@ -38,266 +47,230 @@ class AWSResourceHierarchy:
             dynamodb = boto3.client('dynamodb', region_name=region)
             redshift = boto3.client('redshift', region_name=region)
             
-            # Step 1: Get all VPCs in region
+            # Step 1: Get all VPCs in the region
             vpcs = self._get_vpcs(ec2)
+            if not vpcs:
+                logging.warning(f"No VPCs found or accessible in region {region}.")
+            
+            # Pre-fetch DB subnet groups to map Subnet Group Name to VpcId
+            db_subnet_groups = self._get_db_subnet_groups(rds)
             
             for vpc in vpcs:
                 vpc_id = vpc['VpcId']
                 
-                # Step 2: Build VPC-level hierarchy
+                # Step 2: Build the hierarchy for each VPC
                 self.hierarchy[region][vpc_id] = {
                     'vpc_info': vpc,
                     'network_components': self._get_network_components(ec2, vpc_id),
                     'security_groups': self._get_security_groups(ec2, vpc_id),
                     'resources': {
                         'ec2_instances': self._get_ec2_with_ebs(ec2, vpc_id),
-                        'rds_instances': self._get_rds_resources(rds, vpc_id),
+                        'rds_instances': self._get_rds_resources(rds, vpc_id, db_subnet_groups),
                         'efs_filesystems': self._get_efs_resources(efs, vpc_id),
                         'fsx_filesystems': self._get_fsx_resources(fsx, vpc_id),
                         'redshift_clusters': self._get_redshift_resources(redshift, vpc_id)
                     }
                 }
             
-            # Step 3: Handle region-wide resources (DynamoDB, etc.)
+            # Step 3: Handle resources that are region-wide (not tied to a VPC)
             self.hierarchy[region]['region_wide'] = {
                 'dynamodb_tables': self._get_dynamodb_tables(dynamodb)
             }
             
+        except ClientError as e:
+            logging.error(f"Error processing region {region}. It might be disabled or you lack permissions. Details: {e}")
         except Exception as e:
-            print(f"Error processing region {region}: {e}")
+            logging.error(f"An unexpected error occurred in region {region}: {e}")
+
+    def _get_paginated_results(self, client, method, key, filters=None):
+        """Generic helper function to handle pagination for Boto3 clients."""
+        try:
+            paginator = client.get_paginator(method)
+            page_iterator = paginator.paginate(**(filters or {}))
+            
+            results = []
+            for page in page_iterator:
+                results.extend(page.get(key, []))
+            return results
+        except ClientError as e:
+            logging.error(f"Error during pagination for {client.meta.service_model.service_name}/{method}: {e}")
+            return []
 
     def _get_vpcs(self, ec2):
-        """Get all VPCs in region"""
-        try:
-            response = ec2.describe_vpcs()
-            return response['Vpcs']
-        except Exception as e:
-            print(f"Error getting VPCs: {e}")
-            return []
+        """Get all VPCs in a region using pagination."""
+        return self._get_paginated_results(ec2, 'describe_vpcs', 'Vpcs')
     
     def _get_network_components(self, ec2, vpc_id):
-        """Get network components for VPC"""
-        components = {}
+        """Get all network components for a specific VPC using pagination."""
+        vpc_filter = {'Filters': [{'Name': 'vpc-id', 'Values': [vpc_id]}]}
+        igw_filter = {'Filters': [{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}]}
         
-        try:
-            # Subnets
-            subnets = ec2.describe_subnets(
-                Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
-            )['Subnets']
-            components['subnets'] = subnets
-            
-            # Route Tables
-            route_tables = ec2.describe_route_tables(
-                Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
-            )['RouteTables']
-            components['route_tables'] = route_tables
-            
-            # Internet Gateways
-            igws = ec2.describe_internet_gateways(
-                Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}]
-            )['InternetGateways']
-            components['internet_gateways'] = igws
-            
-            # NAT Gateways
-            nat_gws = ec2.describe_nat_gateways(
-                Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
-            )['NatGateways']
-            components['nat_gateways'] = nat_gws
-            
-        except Exception as e:
-            print(f"Error getting network components for VPC {vpc_id}: {e}")
-            
+        components = {}
+        components['subnets'] = self._get_paginated_results(ec2, 'describe_subnets', 'Subnets', vpc_filter)
+        components['route_tables'] = self._get_paginated_results(ec2, 'describe_route_tables', 'RouteTables', vpc_filter)
+        components['internet_gateways'] = self._get_paginated_results(ec2, 'describe_internet_gateways', 'InternetGateways', igw_filter)
+        components['nat_gateways'] = self._get_paginated_results(ec2, 'describe_nat_gateways', 'NatGateways', vpc_filter)
         return components
     
     def _get_security_groups(self, ec2, vpc_id):
-        """Get security groups for VPC"""
-        try:
-            response = ec2.describe_security_groups(
-                Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
-            )
-            return response['SecurityGroups']
-        except Exception as e:
-            print(f"Error getting security groups for VPC {vpc_id}: {e}")
-            return []
+        """Get all security groups for a specific VPC using pagination."""
+        vpc_filter = {'Filters': [{'Name': 'vpc-id', 'Values': [vpc_id]}]}
+        return self._get_paginated_results(ec2, 'describe_security_groups', 'SecurityGroups', vpc_filter)
 
     def _get_ec2_with_ebs(self, ec2, vpc_id):
-        """Get EC2 instances with associated EBS volumes"""
+        """Get EC2 instances with their associated EBS volumes using pagination."""
         instances_with_ebs = []
+        vpc_filter = {'Filters': [{'Name': 'vpc-id', 'Values': [vpc_id]}]}
         
-        try:
-            response = ec2.describe_instances(
-                Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
-            )
-            
-            for reservation in response['Reservations']:
-                for instance in reservation['Instances']:
-                    # Get EBS volumes attached to this instance
-                    ebs_volumes = []
-                    for bd in instance.get('BlockDeviceMappings', []):
-                        ebs = bd.get('Ebs')
-                        if ebs:
-                            # Get detailed volume information
-                            volume_details = self._get_volume_details(ec2, ebs['VolumeId'])
-                            ebs_volumes.append({
-                                'volume_id': ebs['VolumeId'],
-                                'device_name': bd['DeviceName'],
-                                'delete_on_termination': ebs.get('DeleteOnTermination', False),
-                                'volume_details': volume_details
-                            })
-                    
-                    instances_with_ebs.append({
-                        'instance_id': instance['InstanceId'],
-                        'instance_type': instance['InstanceType'],
-                        'state': instance['State']['Name'],
-                        'subnet_id': instance.get('SubnetId'),
-                        'security_groups': instance.get('SecurityGroups', []),
-                        'tags': instance.get('Tags', []),
-                        'ebs_volumes': ebs_volumes
-                    })
-                    
-        except Exception as e:
-            print(f"Error getting EC2 instances for VPC {vpc_id}: {e}")
-            
+        reservations = self._get_paginated_results(ec2, 'describe_instances', 'Reservations', vpc_filter)
+        
+        for reservation in reservations:
+            for instance in reservation.get('Instances', []):
+                ebs_volumes = []
+                for bd in instance.get('BlockDeviceMappings', []):
+                    ebs = bd.get('Ebs')
+                    if ebs and 'VolumeId' in ebs:
+                        volume_details = self._get_volume_details(ec2, ebs['VolumeId'])
+                        ebs_volumes.append({
+                            'volume_id': ebs['VolumeId'],
+                            'device_name': bd.get('DeviceName'),
+                            'delete_on_termination': ebs.get('DeleteOnTermination', False),
+                            'volume_details': volume_details
+                        })
+                
+                instances_with_ebs.append({
+                    'instance_id': instance.get('InstanceId'),
+                    'instance_type': instance.get('InstanceType'),
+                    'state': instance.get('State', {}).get('Name'),
+                    'subnet_id': instance.get('SubnetId'),
+                    'security_groups': instance.get('SecurityGroups', []),
+                    'tags': instance.get('Tags', []),
+                    'ebs_volumes': ebs_volumes
+                })
         return instances_with_ebs
     
     def _get_volume_details(self, ec2, volume_id):
-        """Get detailed EBS volume information"""
+        """Get detailed information for a single EBS volume."""
         try:
             response = ec2.describe_volumes(VolumeIds=[volume_id])
+            if not response.get('Volumes'):
+                return {}
             volume = response['Volumes'][0]
             return {
-                'size': volume['Size'],
-                'volume_type': volume['VolumeType'],
+                'size': volume.get('Size'),
+                'volume_type': volume.get('VolumeType'),
                 'iops': volume.get('Iops'),
                 'encrypted': volume.get('Encrypted', False),
-                'state': volume['State']
+                'state': volume.get('State')
             }
-        except Exception as e:
-            print(f"Error getting volume details for {volume_id}: {e}")
+        except ClientError as e:
+            logging.error(f"Error getting details for volume {volume_id}: {e}")
             return {}
 
-    def _get_rds_resources(self, rds, vpc_id):
-        """Get RDS instances and Aurora clusters"""
+    def _get_db_subnet_groups(self, rds):
+        """Fetch all DB subnet groups and map their names to VPC IDs for efficient lookup."""
+        subnet_groups = self._get_paginated_results(rds, 'describe_db_subnet_groups', 'DBSubnetGroups')
+        return {sg['DBSubnetGroupName']: sg['VpcId'] for sg in subnet_groups}
+
+    def _get_rds_resources(self, rds, vpc_id, db_subnet_groups):
+        """Get RDS instances and Aurora clusters for a given VPC."""
         rds_resources = {'db_instances': [], 'clusters': []}
         
-        try:
-            # DB Instances
-            db_instances = rds.describe_db_instances()['DBInstances']
-            for db in db_instances:
-                if db.get('DBSubnetGroup', {}).get('VpcId') == vpc_id:
-                    rds_resources['db_instances'].append({
-                        'db_instance_id': db['DBInstanceIdentifier'],
-                        'engine': db['Engine'],
-                        'instance_class': db['DBInstanceClass'],
-                        'allocated_storage': db.get('AllocatedStorage'),
-                        'multi_az': db.get('MultiAZ', False),
-                        'vpc_security_groups': db.get('VpcSecurityGroups', [])
-                    })
-            
-            # Aurora Clusters
-            clusters = rds.describe_db_clusters()['DBClusters']
-            for cluster in clusters:
-                if cluster.get('DBSubnetGroup', {}).get('VpcId') == vpc_id:
-                    rds_resources['clusters'].append({
-                        'cluster_id': cluster['DBClusterIdentifier'],
-                        'engine': cluster['Engine'],
-                        'cluster_members': cluster.get('DBClusterMembers', []),
-                        'vpc_security_groups': cluster.get('VpcSecurityGroups', [])
-                    })
-                    
-        except Exception as e:
-            print(f"Error getting RDS resources: {e}")
-            
+        # RDS DB Instances must be filtered in code as the API doesn't support a VPC filter.
+        db_instances = self._get_paginated_results(rds, 'describe_db_instances', 'DBInstances')
+        for db in db_instances:
+            subnet_group_name = db.get('DBSubnetGroup', {}).get('DBSubnetGroupName')
+            if db_subnet_groups.get(subnet_group_name) == vpc_id:
+                rds_resources['db_instances'].append({
+                    'db_instance_id': db.get('DBInstanceIdentifier'),
+                    'engine': db.get('Engine'),
+                    'instance_class': db.get('DBInstanceClass'),
+                    'multi_az': db.get('MultiAZ', False)
+                })
+        
+        # RDS DB Clusters must also be filtered in code.
+        clusters = self._get_paginated_results(rds, 'describe_db_clusters', 'DBClusters')
+        for cluster in clusters:
+            subnet_group_name = cluster.get('DBSubnetGroup')
+            if db_subnet_groups.get(subnet_group_name) == vpc_id:
+                rds_resources['clusters'].append({
+                    'cluster_id': cluster.get('DBClusterIdentifier'),
+                    'engine': cluster.get('Engine'),
+                    'cluster_members': [member.get('DBInstanceIdentifier') for member in cluster.get('DBClusterMembers', [])]
+                })
         return rds_resources
 
     def _get_efs_resources(self, efs, vpc_id):
-        """Get EFS file systems"""
+        """Get EFS file systems for a VPC. Requires checking mount targets."""
         efs_systems = []
-        try:
-            filesystems = efs.describe_file_systems()['FileSystems']
-            for fs in filesystems:
-                # Get mount targets to check VPC
-                mount_targets = efs.describe_mount_targets(FileSystemId=fs['FileSystemId'])['MountTargets']
+        filesystems = self._get_paginated_results(efs, 'describe_file_systems', 'FileSystems')
+        for fs in filesystems:
+            fs_id = fs.get('FileSystemId')
+            try:
+                mount_targets = efs.describe_mount_targets(FileSystemId=fs_id)['MountTargets']
                 for mt in mount_targets:
                     if mt.get('VpcId') == vpc_id:
                         efs_systems.append({
-                            'file_system_id': fs['FileSystemId'],
-                            'creation_token': fs['CreationToken'],
-                            'life_cycle_state': fs['LifeCycleState'],
-                            'size_in_bytes': fs.get('SizeInBytes', {}).get('Value', 0),
+                            'file_system_id': fs_id,
+                            'life_cycle_state': fs.get('LifeCycleState'),
                             'performance_mode': fs.get('PerformanceMode'),
                             'encrypted': fs.get('Encrypted', False)
                         })
-                        break
-        except Exception as e:
-            print(f"Error getting EFS resources: {e}")
-            
+                        break # Found a mount target in the correct VPC, no need to check others for this FS
+            except ClientError as e:
+                logging.warning(f"Could not describe mount targets for EFS {fs_id}: {e}")
         return efs_systems
 
     def _get_fsx_resources(self, fsx, vpc_id):
-        """Get FSx file systems"""
+        """Get FSx file systems for a VPC."""
         fsx_systems = []
-        try:
-            filesystems = fsx.describe_file_systems()['FileSystems']
-            for fs in filesystems:
-                if fs.get('VpcId') == vpc_id:
-                    fsx_systems.append({
-                        'file_system_id': fs['FileSystemId'],
-                        'file_system_type': fs['FileSystemType'],
-                        'lifecycle_state': fs['Lifecycle'],
-                        'storage_capacity': fs.get('StorageCapacity'),
-                        'vpc_id': fs.get('VpcId'),
-                        'subnet_ids': fs.get('SubnetIds', [])
-                    })
-        except Exception as e:
-            print(f"Error getting FSx resources: {e}")
-            
+        # FSx describe_file_systems must be filtered in code.
+        filesystems = self._get_paginated_results(fsx, 'describe_file_systems', 'FileSystems')
+        for fs in filesystems:
+            if fs.get('VpcId') == vpc_id:
+                fsx_systems.append({
+                    'file_system_id': fs.get('FileSystemId'),
+                    'file_system_type': fs.get('FileSystemType'),
+                    'lifecycle_state': fs.get('Lifecycle'),
+                    'storage_capacity': fs.get('StorageCapacity'),
+                    'subnet_ids': fs.get('SubnetIds', [])
+                })
         return fsx_systems
 
     def _get_redshift_resources(self, redshift, vpc_id):
-        """Get Redshift clusters"""
-        redshift_resources = {'clusters': [], 'serverless_namespaces': []}
-        
-        try:
-            # Redshift Clusters
-            clusters = redshift.describe_clusters()['Clusters']
-            for cluster in clusters:
-                if cluster.get('VpcId') == vpc_id:
-                    redshift_resources['clusters'].append({
-                        'cluster_identifier': cluster['ClusterIdentifier'],
-                        'node_type': cluster.get('NodeType'),
-                        'number_of_nodes': cluster.get('NumberOfNodes'),
-                        'cluster_status': cluster.get('ClusterStatus'),
-                        'vpc_id': cluster.get('VpcId'),
-                        'vpc_security_groups': cluster.get('VpcSecurityGroups', [])
-                    })
-                    
-        except Exception as e:
-            print(f"Error getting Redshift resources: {e}")
-            
+        """Get Redshift clusters for a VPC."""
+        redshift_resources = {'clusters': []}
+        # Redshift describe_clusters must be filtered in code.
+        clusters = self._get_paginated_results(redshift, 'describe_clusters', 'Clusters')
+        for cluster in clusters:
+            if cluster.get('VpcId') == vpc_id:
+                redshift_resources['clusters'].append({
+                    'cluster_identifier': cluster.get('ClusterIdentifier'),
+                    'node_type': cluster.get('NodeType'),
+                    'number_of_nodes': cluster.get('NumberOfNodes'),
+                    'cluster_status': cluster.get('ClusterStatus')
+                })
         return redshift_resources
     
     def _get_dynamodb_tables(self, dynamodb):
-        """Get DynamoDB tables (region-wide resource)"""
+        """Get all DynamoDB tables in a region (region-wide resource)."""
         tables = []
-        try:
-            table_names = dynamodb.list_tables()['TableNames']
-            for table_name in table_names:
+        table_names = self._get_paginated_results(dynamodb, 'list_tables', 'TableNames')
+        for table_name in table_names:
+            try:
                 table_details = dynamodb.describe_table(TableName=table_name)['Table']
                 tables.append({
                     'table_name': table_name,
-                    'table_status': table_details['TableStatus'],
+                    'table_status': table_details.get('TableStatus'),
                     'item_count': table_details.get('ItemCount', 0),
-                    'table_size_bytes': table_details.get('TableSizeBytes', 0),
                     'billing_mode': table_details.get('BillingModeSummary', {}).get('BillingMode', 'PROVISIONED')
                 })
-        except Exception as e:
-            print(f"Error getting DynamoDB tables: {e}")
-            
+            except ClientError as e:
+                logging.error(f"Error describing DynamoDB table {table_name}: {e}")
         return tables
 
     def save_to_file(self, hierarchy, filename=None):
-        """Save hierarchy to JSON file"""
+        """Saves the final hierarchy to a JSON file."""
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"aws_resource_hierarchy_{timestamp}.json"
@@ -305,80 +278,69 @@ class AWSResourceHierarchy:
         try:
             with open(filename, 'w') as f:
                 json.dump(hierarchy, f, indent=2, default=str)
-            print(f"Hierarchy saved to {filename}")
+            logging.info(f"Hierarchy successfully saved to {filename}")
         except Exception as e:
-            print(f"Error saving to file: {e}")
+            logging.error(f"Error saving hierarchy to file: {e}")
 
     def print_summary(self, hierarchy):
-        """Print a summary of the hierarchy"""
-        print("\n" + "="*50)
-        print("AWS RESOURCE HIERARCHY SUMMARY")
-        print("="*50)
+        """Prints a high-level summary of the discovered resources."""
+        summary = "\n" + "="*50 + "\nAWS RESOURCE HIERARCHY SUMMARY\n" + "="*50
         
         for region, vpcs in hierarchy.items():
-            print(f"\nRegion: {region}")
+            summary += f"\nRegion: {region}\n"
             
             for vpc_id, vpc_data in vpcs.items():
                 if vpc_id == 'region_wide':
                     dynamodb_count = len(vpc_data.get('dynamodb_tables', []))
                     if dynamodb_count > 0:
-                        print(f"  Region-wide Resources:")
-                        print(f"    DynamoDB Tables: {dynamodb_count}")
+                        summary += f"  Region-wide Resources:\n"
+                        summary += f"    DynamoDB Tables: {dynamodb_count}\n"
                 else:
-                    print(f"  VPC: {vpc_id}")
-                    
-                    # Network components
+                    summary += f"  VPC: {vpc_id}\n"
                     network = vpc_data.get('network_components', {})
-                    print(f"    Subnets: {len(network.get('subnets', []))}")
-                    print(f"    Security Groups: {len(vpc_data.get('security_groups', []))}")
+                    summary += f"    Subnets: {len(network.get('subnets', []))}\n"
+                    summary += f"    Security Groups: {len(vpc_data.get('security_groups', []))}\n"
                     
-                    # Resources
                     resources = vpc_data.get('resources', {})
                     ec2_instances = resources.get('ec2_instances', [])
-                    print(f"    EC2 Instances: {len(ec2_instances)}")
+                    total_ebs = sum(len(i.get('ebs_volumes', [])) for i in ec2_instances)
                     
-                    # Count EBS volumes
-                    total_ebs = sum(len(instance.get('ebs_volumes', [])) for instance in ec2_instances)
-                    print(f"    EBS Volumes: {total_ebs}")
-                    
-                    print(f"    RDS Instances: {len(resources.get('rds_instances', {}).get('db_instances', []))}")
-                    print(f"    RDS Clusters: {len(resources.get('rds_instances', {}).get('clusters', []))}")
-                    print(f"    EFS File Systems: {len(resources.get('efs_filesystems', []))}")
-                    print(f"    FSx File Systems: {len(resources.get('fsx_filesystems', []))}")
-                    print(f"    Redshift Clusters: {len(resources.get('redshift_clusters', {}).get('clusters', []))}")
+                    summary += f"    EC2 Instances: {len(ec2_instances)}\n"
+                    summary += f"    EBS Volumes: {total_ebs}\n"
+                    summary += f"    RDS Instances: {len(resources.get('rds_instances', {}).get('db_instances', []))}\n"
+                    summary += f"    RDS Clusters: {len(resources.get('rds_instances', {}).get('clusters', []))}\n"
+                    summary += f"    EFS File Systems: {len(resources.get('efs_filesystems', []))}\n"
+                    summary += f"    FSx File Systems: {len(resources.get('fsx_filesystems', []))}\n"
+                    summary += f"    Redshift Clusters: {len(resources.get('redshift_clusters', {}).get('clusters', []))}\n"
+        
+        logging.info(summary)
 
 def main():
-    """Main execution function"""
-    print("AWS Resource Hierarchy Builder")
-    print("Supports all Veeam Backup for AWS resource types")
-    print("-" * 50)
+    """Main execution function to run the hierarchy builder."""
+    logging.info("Starting AWS Resource Hierarchy Builder")
     
-    # Initialize the hierarchy builder
     builder = AWSResourceHierarchy()
     
-    # You can specify specific regions or leave empty for all regions
-    regions = None  # or ['us-east-1', 'us-west-2'] for specific regions
+    # Set to None to scan all available regions.
+    # Or specify a list: regions = ['us-east-1', 'us-west-2']
+    regions = None
     
     try:
-        # Build the hierarchy
-        print("Building AWS resource hierarchy...")
+        logging.info("Building AWS resource hierarchy...")
         hierarchy = builder.build_hierarchy(regions)
         
         if not hierarchy:
-            print("No resources found or access denied. Check your AWS credentials and permissions.")
+            logging.warning("No resources found or access was denied. Check your AWS credentials and IAM permissions.")
             return
         
-        # Print summary
         builder.print_summary(hierarchy)
-        
-        # Save to file
         builder.save_to_file(hierarchy)
         
-        print(f"\nHierarchy building completed successfully!")
+        logging.info("Hierarchy building completed successfully!")
         
     except Exception as e:
-        print(f"Error building hierarchy: {e}")
-        print("Make sure you have valid AWS credentials configured.")
+        logging.critical(f"A critical error occurred during execution: {e}", exc_info=True)
+        logging.critical("Ensure you have valid AWS credentials configured (e.g., via environment variables, IAM role).")
 
 if __name__ == "__main__":
     main()
