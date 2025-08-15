@@ -1,7 +1,3 @@
-Of course. Here is the complete, updated `README.md` in a single Markdown block.
-
-***
-
 # AWS Collect
 
 🤖 **AI Disclosure**      
