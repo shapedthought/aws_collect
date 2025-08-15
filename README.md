@@ -8,41 +8,42 @@ Portions of the code and/or documentation for this project were created with the
 The **AWS Collect** script programmatically collects and organizes your AWS resources in a top-down, hierarchical structure, as depicted in the supplied architecture diagram:
 
 ```
-Region
+Account
 │
-├── VPC
-│   │
-│   ├── vpc_info
-│   ├── network_components
-│   │     ├── subnets
-│   │     ├── route_tables
-│   │     ├── internet_gateways
-│   │     └── nat_gateways
-│   ├── security_groups
-│   └── resources
-│         ├── ec2_instances
-│         │     └── ebs_volumes
-│         ├── rds_instances
-│         │     ├── db_instances
-│         │     └── clusters
-│         ├── efs_filesystems
-│         ├── fsx_filesystems
-│         └── redshift_clusters
+├── global_resources
+│   └── s3_buckets
 │
-└── region_wide
-      └── dynamodb_tables
-
+└── Region
+    │
+    ├── VPC
+    │   │
+    │   ├── vpc_info
+    │   ├── network_components
+    │   │     ├── subnets, route_tables, etc.
+    │   ├── security_groups
+    │   └── resources
+    │         ├── ec2_instances (& ebs_volumes)
+    │         ├── rds_instances
+    │         ├── efs_filesystems
+    │         ├── fsx_filesystems
+    │         └── redshift_clusters
+    │
+    └── region_wide
+          └── dynamodb_tables
 ```
 
 The script is designed to support all resource types relevant to Veeam Backup for AWS, making it ideal for inventory, migration planning, and backup sizing scenarios.
 
-- **Discovers and groups AWS resources by**:
-  - Region
-  - VPC
-  - Network components (Subnets, Route Tables, Gateways)
-  - Security Groups
-  - EC2 Instances with associated EBS volumes
-  - Other Veeam-supported resources: RDS, Aurora, DynamoDB, EFS, FSx, Redshift
+- **Discovers and groups AWS resources by scope**:
+  - **Global**: S3 Buckets
+  - **Regional**: VPCs, DynamoDB Tables
+  - **VPC-Specific**: EC2, RDS, Aurora, EFS, FSx, Redshift
+
+- **Includes key capacity metrics for all supported resources**:
+  - S3: Bucket size and object count
+  - EBS: Volume size
+  - RDS: Allocated storage
+  - EFS/FSx/DynamoDB: Storage size and/or item counts
 
 - **Outputs everything as a single, structured JSON file**
 - **Provides powerful CLI options** to filter regions and exclude resource types
@@ -64,7 +65,7 @@ The script is designed to support all resource types relevant to Veeam Backup fo
 
 ## Usage
 
-The script is now a command-line interface (CLI) tool. Save it as `aws_collect.py` and run it from your terminal.
+The script is a command-line interface (CLI) tool. Save it as `aws_collect.py` and run it from your terminal.
 
 #### **1. Get Help**
 
@@ -76,7 +77,7 @@ python aws_collect.py --help
 
 #### **2. Basic Scan**
 
-Run the script with no options to scan all accessible AWS regions and save the results to a timestamped JSON file (e.g., `aws_resource_hierarchy_20250815_104600.json`).
+Run the script with no options to scan all global and regional resources, saving the results to a timestamped JSON file (e.g., `aws_resource_hierarchy_20250815_104600.json`).
 
 ```bash
 python aws_collect.py
@@ -100,9 +101,9 @@ You can combine the following flags to customize the scan:
   python aws_collect.py --region us-east-1 --region eu-west-1
   ```
 
-- **Scan all regions but exclude RDS and EFS resources:**
+- **Scan all resources but exclude S3 and RDS:**
   ```bash
-  python aws_collect.py --exclude rds --exclude efs
+  python aws_collect.py --exclude s3 --exclude rds
   ```
 
 - **Scan a single region, exclude DynamoDB, and save to a custom file:**
@@ -110,47 +111,50 @@ You can combine the following flags to customize the scan:
   python aws_collect.py -r us-west-2 -x dynamodb -o my_compute_resources.json
   ```
 
-- **Run a scan with verbose logging for debugging:**
+- **Scan only global S3 resources (by excluding everything else):**
   ```bash
-  python aws_collect.py -v -r us-east-1
+  python aws_collect.py --exclude ec2 --exclude rds --exclude efs --exclude fsx --exclude redshift --exclude dynamodb
   ```
 
 #### **4. Review the Output File**
 
-The output file contains your resource hierarchy in a top-down fashion for all discovered resources, matching the logical arrangement shown in the architecture diagram above.
+The output file contains your resource hierarchy in a top-down fashion.
 
 Example (JSON snippet):
 ```json
 {
-   "us-east-1": {
-      "vpc-xxxxxxx": {
-         "vpc_info": { ... },
-         "network_components": { ... },
-         "security_groups": [ ... ],
-         "resources": {
-            "ec2_instances": [
-               {
-                  "instance_id": "i-abcdefg",
-                  "ebs_volumes": [
-                     { "volume_id": "vol-123456..." }
-                  ]
-               }
-            ],
-            ...
-         }
-      },
-      "region_wide": {
-         "dynamodb_tables": [ ... ]
+  "global_resources": {
+    "s3_buckets": [
+      {
+        "name": "my-production-bucket",
+        "creation_date": "2024-01-01T12:00:00+00:00",
+        "region": "eu-west-1",
+        "size_bytes": 10737418240,
+        "object_count": 5201
       }
-   }
+    ]
+  },
+  "us-east-1": {
+    "vpc-xxxxxxx": {
+      "vpc_info": { ... },
+      "resources": {
+        "ec2_instances": [ ... ],
+        "rds_instances": {
+           "db_instances": [
+              {
+                 "db_instance_id": "my-db",
+                 "allocated_storage": 100
+              }
+           ]
+        }
+      }
+    }
+  }
 }
 ```
 
-## Extensibility
-
-The script is modular—extend it to add new resource types or customize the hierarchy as needed for your organization.
-
 ## Troubleshooting
 
-- **No data or permission errors**: Ensure your AWS IAM user/role has sufficient read-only permissions (e.g., policies with `Describe*`, `List*`, `Get*`) for EC2, EBS, VPC, RDS, DynamoDB, EFS, FSx, and Redshift resources.
-- **API throttling**: The script uses Boto3 paginators to correctly handle large numbers of resources and is suitable for larger environments. In extremely large accounts with very high resource counts, you may still encounter AWS API rate limiting. If this occurs, consider running the scan for one region at a time.
+- **No data or permission errors**: Ensure your IAM user/role has sufficient read-only permissions (e.g., policies with `Describe*`, `List*`, `Get*`) for all target services. Note that S3 discovery also requires `cloudwatch:GetMetricStatistics`.
+- **Inaccurate S3 metrics**: S3 bucket size and object count are retrieved from CloudWatch, which updates these metrics approximately once per day. The reported figures will reflect the last daily update.
+- **API throttling**: The script uses Boto3 paginators to handle large numbers of resources. In extremely large accounts, you may still encounter AWS API rate limiting. If this occurs, consider running the scan for one region at a time.
