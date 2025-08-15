@@ -1,20 +1,19 @@
 import boto3
 import click
 from botocore.exceptions import ClientError
-from collections import defaultdict
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # A list of resource types that can be excluded from the scan.
-EXCLUDABLE_RESOURCES = ['ec2', 'rds', 'efs', 'fsx', 'redshift', 'dynamodb']
+EXCLUDABLE_RESOURCES = ['ec2', 'rds', 'efs', 'fsx', 'redshift', 'dynamodb', 's3']
 
 class AWSResourceHierarchy:
     def __init__(self, excluded_resources=None):
         """
         Initializes the data structure and stores the set of excluded resources.
         """
-        self.hierarchy = defaultdict(lambda: defaultdict(dict))
+        self.hierarchy = {}  # Changed to a plain dict to resolve type mismatch
         # Use a set for efficient 'in' checks
         self.excluded_resources = set(excluded_resources) if excluded_resources else set()
         if self.excluded_resources:
@@ -22,9 +21,14 @@ class AWSResourceHierarchy:
 
     def build_hierarchy(self, regions=None):
         """
-        Builds a complete AWS resource hierarchy.
-        If regions are not specified, it attempts to discover all available regions.
+        Builds a complete AWS resource hierarchy, including global resources.
         """
+        # Step 1: Handle Global Resources like S3
+        if 's3' not in self.excluded_resources:
+            logging.info("Processing global resources: S3")
+            self._build_global_resources()
+
+        # Step 2: Handle Regional Resources
         if not regions:
             try:
                 ec2_client = boto3.client('ec2')
@@ -38,10 +42,87 @@ class AWSResourceHierarchy:
             self._build_region_hierarchy(region)
             
         return dict(self.hierarchy)
+
+    def _build_global_resources(self):
+        """Builds the hierarchy for global resources not tied to a region (e.g., S3)."""
+        s3_buckets = []
+        try:
+            s3_client = boto3.client('s3')
+            response = s3_client.list_buckets()
+
+            for bucket in response.get('Buckets', []):
+                bucket_name = bucket['Name']
+                logging.debug(f"Getting details for S3 bucket: {bucket_name}")
+                bucket_data = {
+                    'name': bucket_name,
+                    'creation_date': bucket['CreationDate'],
+                    'region': 'us-east-1', # Default region
+                    'size_bytes': 0,
+                    'object_count': 0
+                }
+                
+                try:
+                    # Get bucket region - this is a crucial step for subsequent API calls
+                    location_response = s3_client.get_bucket_location(Bucket=bucket_name)
+                    bucket_data['region'] = location_response.get('LocationConstraint') or 'us-east-1'
+                    
+                    # Get bucket size and object count from CloudWatch
+                    size_bytes, object_count = self._get_s3_bucket_metrics(bucket_name, bucket_data['region'])
+                    bucket_data['size_bytes'] = size_bytes
+                    bucket_data['object_count'] = object_count
+
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'AccessDenied':
+                        logging.warning(f"Access denied when getting location or metrics for S3 bucket {bucket_name}. Storing partial data.")
+                    else:
+                        logging.warning(f"Could not get details for S3 bucket {bucket_name}: {e}")
+                
+                s3_buckets.append(bucket_data)
+
+            # This assignment is now valid because self.hierarchy is a plain dict
+            self.hierarchy['global_resources'] = {
+                's3_buckets': s3_buckets
+            }
+        except ClientError as e:
+            logging.error(f"Could not list S3 buckets. Check IAM permissions for s3:ListAllMyBuckets. Details: {e}")
+    
+    def _get_s3_bucket_metrics(self, bucket_name, region):
+        """Gets bucket size and object count from CloudWatch."""
+        cw_client = boto3.client('cloudwatch', region_name=region)
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(days=2)
+        
+        def get_metric(metric_name, storage_type):
+            try:
+                response = cw_client.get_metric_statistics(
+                    Namespace='AWS/S3',
+                    MetricName=metric_name,
+                    Dimensions=[
+                        {'Name': 'BucketName', 'Value': bucket_name},
+                        {'Name': 'StorageType', 'Value': storage_type}
+                    ],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400, # Daily
+                    Statistics=['Average']
+                )
+                if response['Datapoints']:
+                    latest = sorted(response['Datapoints'], key=lambda x: x['Timestamp'], reverse=True)[0]
+                    return int(latest['Average'])
+            except ClientError as e:
+                logging.debug(f"Could not get CloudWatch metric {metric_name} for bucket {bucket_name}: {e}")
+            return 0
+
+        size_bytes = get_metric('BucketSizeBytes', 'StandardStorage')
+        object_count = get_metric('NumberOfObjects', 'AllStorageTypes')
+        return size_bytes, object_count
     
     def _build_region_hierarchy(self, region):
         """Builds the hierarchy for a single specified region, respecting exclusions."""
         try:
+            # Ensure the region key exists before we start adding VPCs to it
+            self.hierarchy.setdefault(region, {})
+
             # Initialize clients for the specified region
             ec2 = boto3.client('ec2', region_name=region)
             rds = boto3.client('rds', region_name=region) if 'rds' not in self.excluded_resources else None
@@ -196,6 +277,7 @@ class AWSResourceHierarchy:
                     'db_instance_id': db.get('DBInstanceIdentifier'),
                     'engine': db.get('Engine'),
                     'instance_class': db.get('DBInstanceClass'),
+                    'allocated_storage': db.get('AllocatedStorage'),
                     'multi_az': db.get('MultiAZ', False)
                 })
         
@@ -217,16 +299,14 @@ class AWSResourceHierarchy:
         for fs in filesystems:
             fs_id = fs.get('FileSystemId')
             try:
-                mount_targets = efs.describe_mount_targets(FileSystemId=fs_id)['MountTargets']
-                for mt in mount_targets:
-                    if mt.get('VpcId') == vpc_id:
-                        efs_systems.append({
-                            'file_system_id': fs_id,
-                            'life_cycle_state': fs.get('LifeCycleState'),
-                            'performance_mode': fs.get('PerformanceMode'),
-                            'encrypted': fs.get('Encrypted', False)
-                        })
-                        break
+                # Add SizeInBytes to the collected data
+                efs_systems.append({
+                    'file_system_id': fs_id,
+                    'life_cycle_state': fs.get('LifeCycleState'),
+                    'performance_mode': fs.get('PerformanceMode'),
+                    'size_in_bytes': fs.get('SizeInBytes', {}).get('Value', 0),
+                    'encrypted': fs.get('Encrypted', False)
+                })
             except ClientError as e:
                 logging.warning(f"Could not describe mount targets for EFS {fs_id}: {e}")
         return efs_systems
@@ -271,6 +351,7 @@ class AWSResourceHierarchy:
                     'table_name': table_name,
                     'table_status': table_details.get('TableStatus'),
                     'item_count': table_details.get('ItemCount', 0),
+                    'table_size_bytes': table_details.get('TableSizeBytes', 0),
                     'billing_mode': table_details.get('BillingModeSummary', {}).get('BillingMode', 'PROVISIONED')
                 })
             except ClientError as e:
@@ -294,10 +375,18 @@ class AWSResourceHierarchy:
         """Prints a high-level summary of the discovered resources."""
         summary = "\n" + "="*50 + "\nAWS RESOURCE HIERARCHY SUMMARY\n" + "="*50
         
-        for region, vpcs in hierarchy.items():
+        if 'global_resources' in hierarchy:
+            s3_count = len(hierarchy['global_resources'].get('s3_buckets', []))
+            summary += f"\nGlobal Resources:\n"
+            summary += f"  S3 Buckets: {s3_count}\n"
+
+        for region, data in hierarchy.items():
+            if region == 'global_resources':
+                continue
+
             summary += f"\nRegion: {region}\n"
             
-            for vpc_id, vpc_data in vpcs.items():
+            for vpc_id, vpc_data in data.items():
                 if vpc_id == 'region_wide':
                     dynamodb_count = len(vpc_data.get('dynamodb_tables', []))
                     if dynamodb_count > 0:
@@ -354,8 +443,8 @@ def main(region, exclude, output, verbose):
     """
     A CLI tool to scan AWS resources and build a hierarchical JSON representation.
     
-    This tool discovers resources like VPCs, EC2 instances, RDS databases, and more,
-    organizing them by region and VPC.
+    This tool discovers resources like S3, VPCs, EC2 instances, RDS databases, and more,
+    organizing them by scope (global, regional, VPC).
     """
     # Configure logging based on the verbose flag
     log_level = logging.DEBUG if verbose else logging.INFO
