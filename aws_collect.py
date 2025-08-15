@@ -1,21 +1,24 @@
 import boto3
+import click
 from botocore.exceptions import ClientError
 from collections import defaultdict
 import json
 import logging
 from datetime import datetime
 
-# --- Setup Logging ---
-# Configure logging to provide informative output.
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# A list of resource types that can be excluded from the scan.
+EXCLUDABLE_RESOURCES = ['ec2', 'rds', 'efs', 'fsx', 'redshift', 'dynamodb']
 
 class AWSResourceHierarchy:
-    def __init__(self):
+    def __init__(self, excluded_resources=None):
         """
-        Initializes the data structure for holding the resource hierarchy.
-        Using nested defaultdicts simplifies adding new regions and VPCs.
+        Initializes the data structure and stores the set of excluded resources.
         """
         self.hierarchy = defaultdict(lambda: defaultdict(dict))
+        # Use a set for efficient 'in' checks
+        self.excluded_resources = set(excluded_resources) if excluded_resources else set()
+        if self.excluded_resources:
+            logging.info(f"Excluding the following resources from the scan: {', '.join(self.excluded_resources)}")
 
     def build_hierarchy(self, regions=None):
         """
@@ -37,50 +40,59 @@ class AWSResourceHierarchy:
         return dict(self.hierarchy)
     
     def _build_region_hierarchy(self, region):
-        """Builds the hierarchy for a single specified region."""
+        """Builds the hierarchy for a single specified region, respecting exclusions."""
         try:
             # Initialize clients for the specified region
             ec2 = boto3.client('ec2', region_name=region)
-            rds = boto3.client('rds', region_name=region)
-            efs = boto3.client('efs', region_name=region)
-            fsx = boto3.client('fsx', region_name=region)
-            dynamodb = boto3.client('dynamodb', region_name=region)
-            redshift = boto3.client('redshift', region_name=region)
+            rds = boto3.client('rds', region_name=region) if 'rds' not in self.excluded_resources else None
+            efs = boto3.client('efs', region_name=region) if 'efs' not in self.excluded_resources else None
+            fsx = boto3.client('fsx', region_name=region) if 'fsx' not in self.excluded_resources else None
+            dynamodb = boto3.client('dynamodb', region_name=region) if 'dynamodb' not in self.excluded_resources else None
+            redshift = boto3.client('redshift', region_name=region) if 'redshift' not in self.excluded_resources else None
             
-            # Step 1: Get all VPCs in the region
             vpcs = self._get_vpcs(ec2)
             if not vpcs:
                 logging.warning(f"No VPCs found or accessible in region {region}.")
             
-            # Pre-fetch DB subnet groups to map Subnet Group Name to VpcId
-            db_subnet_groups = self._get_db_subnet_groups(rds)
+            db_subnet_groups = self._get_db_subnet_groups(rds) if rds else {}
             
             for vpc in vpcs:
                 vpc_id = vpc['VpcId']
+                logging.debug(f"Processing VPC {vpc_id} in region {region}")
                 
-                # Step 2: Build the hierarchy for each VPC
+                # Conditionally build the resources dictionary based on exclusions
+                resources = {}
+                if 'ec2' not in self.excluded_resources:
+                    resources['ec2_instances'] = self._get_ec2_with_ebs(ec2, vpc_id)
+                if rds:
+                    resources['rds_instances'] = self._get_rds_resources(rds, vpc_id, db_subnet_groups)
+                if efs:
+                    resources['efs_filesystems'] = self._get_efs_resources(efs, vpc_id)
+                if fsx:
+                    resources['fsx_filesystems'] = self._get_fsx_resources(fsx, vpc_id)
+                if redshift:
+                    resources['redshift_clusters'] = self._get_redshift_resources(redshift, vpc_id)
+                
                 self.hierarchy[region][vpc_id] = {
                     'vpc_info': vpc,
                     'network_components': self._get_network_components(ec2, vpc_id),
                     'security_groups': self._get_security_groups(ec2, vpc_id),
-                    'resources': {
-                        'ec2_instances': self._get_ec2_with_ebs(ec2, vpc_id),
-                        'rds_instances': self._get_rds_resources(rds, vpc_id, db_subnet_groups),
-                        'efs_filesystems': self._get_efs_resources(efs, vpc_id),
-                        'fsx_filesystems': self._get_fsx_resources(fsx, vpc_id),
-                        'redshift_clusters': self._get_redshift_resources(redshift, vpc_id)
-                    }
+                    'resources': resources
                 }
             
-            # Step 3: Handle resources that are region-wide (not tied to a VPC)
-            self.hierarchy[region]['region_wide'] = {
-                'dynamodb_tables': self._get_dynamodb_tables(dynamodb)
-            }
+            # Handle region-wide resources
+            if dynamodb:
+                self.hierarchy[region]['region_wide'] = {
+                    'dynamodb_tables': self._get_dynamodb_tables(dynamodb)
+                }
             
         except ClientError as e:
-            logging.error(f"Error processing region {region}. It might be disabled or you lack permissions. Details: {e}")
+            if e.response['Error']['Code'] == 'AuthFailure' or 'AccessDenied' in e.response['Error']['Code']:
+                logging.warning(f"Could not access services in region {region}. It may not be enabled. Skipping.")
+            else:
+                 logging.error(f"A client error occurred in region {region}: {e}")
         except Exception as e:
-            logging.error(f"An unexpected error occurred in region {region}: {e}")
+            logging.error(f"An unexpected error occurred in region {region}: {e}", exc_info=True)
 
     def _get_paginated_results(self, client, method, key, filters=None):
         """Generic helper function to handle pagination for Boto3 clients."""
@@ -176,7 +188,6 @@ class AWSResourceHierarchy:
         """Get RDS instances and Aurora clusters for a given VPC."""
         rds_resources = {'db_instances': [], 'clusters': []}
         
-        # RDS DB Instances must be filtered in code as the API doesn't support a VPC filter.
         db_instances = self._get_paginated_results(rds, 'describe_db_instances', 'DBInstances')
         for db in db_instances:
             subnet_group_name = db.get('DBSubnetGroup', {}).get('DBSubnetGroupName')
@@ -188,7 +199,6 @@ class AWSResourceHierarchy:
                     'multi_az': db.get('MultiAZ', False)
                 })
         
-        # RDS DB Clusters must also be filtered in code.
         clusters = self._get_paginated_results(rds, 'describe_db_clusters', 'DBClusters')
         for cluster in clusters:
             subnet_group_name = cluster.get('DBSubnetGroup')
@@ -216,7 +226,7 @@ class AWSResourceHierarchy:
                             'performance_mode': fs.get('PerformanceMode'),
                             'encrypted': fs.get('Encrypted', False)
                         })
-                        break # Found a mount target in the correct VPC, no need to check others for this FS
+                        break
             except ClientError as e:
                 logging.warning(f"Could not describe mount targets for EFS {fs_id}: {e}")
         return efs_systems
@@ -224,7 +234,6 @@ class AWSResourceHierarchy:
     def _get_fsx_resources(self, fsx, vpc_id):
         """Get FSx file systems for a VPC."""
         fsx_systems = []
-        # FSx describe_file_systems must be filtered in code.
         filesystems = self._get_paginated_results(fsx, 'describe_file_systems', 'FileSystems')
         for fs in filesystems:
             if fs.get('VpcId') == vpc_id:
@@ -240,7 +249,6 @@ class AWSResourceHierarchy:
     def _get_redshift_resources(self, redshift, vpc_id):
         """Get Redshift clusters for a VPC."""
         redshift_resources = {'clusters': []}
-        # Redshift describe_clusters must be filtered in code.
         clusters = self._get_paginated_results(redshift, 'describe_clusters', 'Clusters')
         for cluster in clusters:
             if cluster.get('VpcId') == vpc_id:
@@ -278,7 +286,7 @@ class AWSResourceHierarchy:
         try:
             with open(filename, 'w') as f:
                 json.dump(hierarchy, f, indent=2, default=str)
-            logging.info(f"Hierarchy successfully saved to {filename}")
+            click.echo(f"Hierarchy successfully saved to {filename}")
         except Exception as e:
             logging.error(f"Error saving hierarchy to file: {e}")
 
@@ -305,42 +313,77 @@ class AWSResourceHierarchy:
                     ec2_instances = resources.get('ec2_instances', [])
                     total_ebs = sum(len(i.get('ebs_volumes', [])) for i in ec2_instances)
                     
-                    summary += f"    EC2 Instances: {len(ec2_instances)}\n"
-                    summary += f"    EBS Volumes: {total_ebs}\n"
-                    summary += f"    RDS Instances: {len(resources.get('rds_instances', {}).get('db_instances', []))}\n"
-                    summary += f"    RDS Clusters: {len(resources.get('rds_instances', {}).get('clusters', []))}\n"
-                    summary += f"    EFS File Systems: {len(resources.get('efs_filesystems', []))}\n"
-                    summary += f"    FSx File Systems: {len(resources.get('fsx_filesystems', []))}\n"
-                    summary += f"    Redshift Clusters: {len(resources.get('redshift_clusters', {}).get('clusters', []))}\n"
+                    if 'ec2_instances' in resources:
+                        summary += f"    EC2 Instances: {len(ec2_instances)}\n"
+                        summary += f"    EBS Volumes: {total_ebs}\n"
+                    if 'rds_instances' in resources:
+                        summary += f"    RDS Instances: {len(resources.get('rds_instances', {}).get('db_instances', []))}\n"
+                        summary += f"    RDS Clusters: {len(resources.get('rds_instances', {}).get('clusters', []))}\n"
+                    if 'efs_filesystems' in resources:
+                        summary += f"    EFS File Systems: {len(resources.get('efs_filesystems', []))}\n"
+                    if 'fsx_filesystems' in resources:
+                        summary += f"    FSx File Systems: {len(resources.get('fsx_filesystems', []))}\n"
+                    if 'redshift_clusters' in resources:
+                        summary += f"    Redshift Clusters: {len(resources.get('redshift_clusters', {}).get('clusters', []))}\n"
         
-        logging.info(summary)
+        click.echo(summary)
 
-def main():
-    """Main execution function to run the hierarchy builder."""
-    logging.info("Starting AWS Resource Hierarchy Builder")
+
+@click.command()
+@click.option(
+    '-r', '--region',
+    multiple=True,
+    help='Specify AWS region(s) to scan. Can be used multiple times. Defaults to all accessible regions.'
+)
+@click.option(
+    '-x', '--exclude',
+    multiple=True,
+    type=click.Choice(EXCLUDABLE_RESOURCES, case_sensitive=False),
+    help='Exclude a resource type from the scan. Can be used multiple times.'
+)
+@click.option(
+    '-o', '--output',
+    help='The filename for the JSON output. Defaults to a timestamped filename.'
+)
+@click.option(
+    '-v', '--verbose',
+    is_flag=True,
+    help='Enable verbose logging for debugging.'
+)
+def main(region, exclude, output, verbose):
+    """
+    A CLI tool to scan AWS resources and build a hierarchical JSON representation.
     
-    builder = AWSResourceHierarchy()
+    This tool discovers resources like VPCs, EC2 instances, RDS databases, and more,
+    organizing them by region and VPC.
+    """
+    # Configure logging based on the verbose flag
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    click.echo("Starting AWS Resource Hierarchy Builder...")
     
-    # Set to None to scan all available regions.
-    # Or specify a list: regions = ['us-east-1', 'us-west-2']
-    regions = None
+    builder = AWSResourceHierarchy(excluded_resources=exclude)
+    
+    regions_to_scan = list(region) if region else None
     
     try:
         logging.info("Building AWS resource hierarchy...")
-        hierarchy = builder.build_hierarchy(regions)
+        hierarchy = builder.build_hierarchy(regions_to_scan)
         
         if not hierarchy:
             logging.warning("No resources found or access was denied. Check your AWS credentials and IAM permissions.")
             return
         
         builder.print_summary(hierarchy)
-        builder.save_to_file(hierarchy)
+        builder.save_to_file(hierarchy, output)
         
-        logging.info("Hierarchy building completed successfully!")
+        click.secho("\nHierarchy building completed successfully!", fg='green')
         
     except Exception as e:
         logging.critical(f"A critical error occurred during execution: {e}", exc_info=True)
         logging.critical("Ensure you have valid AWS credentials configured (e.g., via environment variables, IAM role).")
+
 
 if __name__ == "__main__":
     main()
